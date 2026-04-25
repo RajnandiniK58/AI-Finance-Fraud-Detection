@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import joblib
+import numpy as np
 import pandas as pd
 from sklearn.ensemble import IsolationForest
 from sklearn.preprocessing import StandardScaler
@@ -17,6 +18,9 @@ def load_and_preprocess_data(csv_path: Path) -> pd.DataFrame:
     numeric_df = df.select_dtypes(include=["number"]).copy()
     if numeric_df.empty:
         raise ValueError("No numeric columns available after preprocessing.")
+
+    if "amount" in numeric_df.columns:
+        numeric_df["amount"] = np.log1p(numeric_df["amount"].clip(lower=0))
 
     # Fill missing numeric values with median to keep feature distributions stable.
     numeric_df = numeric_df.fillna(numeric_df.median(numeric_only=True))

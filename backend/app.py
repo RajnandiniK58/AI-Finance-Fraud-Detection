@@ -2,6 +2,7 @@ from pathlib import Path
 from typing import Any
 
 import joblib
+import numpy as np
 import pandas as pd
 from flask import Flask, jsonify, request
 from flask_cors import CORS
@@ -12,6 +13,18 @@ MODEL_PATH = BASE_DIR / "model.pkl"
 
 app = Flask(__name__)
 CORS(app)
+
+
+def get_inference_components() -> tuple[Any, Any, list[str]]:
+    artifact = load_artifact()
+    model = artifact["model"]
+    scaler = artifact["scaler"]
+    feature_columns = artifact.get("feature_columns")
+    if not feature_columns and hasattr(scaler, "feature_names_in_"):
+        feature_columns = list(scaler.feature_names_in_)
+    if not feature_columns:
+        raise ValueError("Model artifact is missing training feature columns.")
+    return model, scaler, list(feature_columns)
 
 
 def load_artifact() -> dict[str, Any]:
@@ -59,9 +72,20 @@ def preprocess_for_inference(raw_df: pd.DataFrame, scaler: Any) -> Any:
     # Mirror training preprocessing exactly:
     # drop non-feature columns, then keep only numeric columns, then fill missing values.
     cleaned_df = raw_df.drop(columns=["transaction_id", "is_fraud"], errors="ignore")
+    alias_map = {
+        "transaction_hour": "transaction",
+        "device_trust_score": "device_trust",
+        "velocity_last_24h": "velocity_last_hour",
+    }
+    for source_col, target_col in alias_map.items():
+        if source_col in cleaned_df.columns and target_col not in cleaned_df.columns:
+            cleaned_df[target_col] = cleaned_df[source_col]
     numeric_df = cleaned_df.select_dtypes(include=["number"]).copy()
     if numeric_df.empty:
         raise ValueError("No numeric columns found in input data.")
+
+    if "amount" in numeric_df.columns:
+        numeric_df["amount"] = np.log1p(numeric_df["amount"].clip(lower=0))
 
     numeric_df = numeric_df.fillna(numeric_df.median(numeric_only=True))
 
@@ -90,6 +114,22 @@ def align_and_scale_features(numeric_df: pd.DataFrame, scaler: Any, feature_colu
     return scaler.transform(aligned_df)
 
 
+def compute_fraud_confidence(anomaly_score: float, raw_row: pd.Series) -> float:
+    # Convert IsolationForest decision score to fraud-likelihood confidence in [0, 1].
+    confidence = float(1.0 / (1.0 + np.exp(anomaly_score)))
+
+    amount = float(raw_row.get("amount", 0.0))
+    foreign_txn = float(raw_row.get("foreign_transaction", 0.0))
+    velocity = float(raw_row.get("velocity_last_24h", raw_row.get("velocity_last_hour", 0.0)))
+
+    if amount > 50000 and foreign_txn == 1:
+        confidence += 0.15
+    if velocity > 10:
+        confidence += 0.10
+
+    return float(np.clip(confidence, 0.0, 1.0))
+
+
 @app.route("/health", methods=["GET"])
 def health() -> Any:
     return jsonify({"status": "API is running"}), 200
@@ -98,16 +138,13 @@ def health() -> Any:
 @app.route("/predict", methods=["POST"])
 def predict() -> Any:
     try:
-        artifact = load_artifact()
-        model = artifact["model"]
-        scaler = artifact["scaler"]
-        feature_columns = artifact.get("feature_columns")
-        if not feature_columns and hasattr(scaler, "feature_names_in_"):
-            feature_columns = list(scaler.feature_names_in_)
-        if not feature_columns:
-            raise ValueError("Model artifact is missing training feature columns.")
+        model, scaler, feature_columns = get_inference_components()
 
         raw_df = parse_input_to_dataframe()
+        missing_cols = set(feature_columns) - set(raw_df.columns)
+        if missing_cols:
+            raise ValueError(f"Missing columns: {missing_cols}")
+        raw_df = raw_df[feature_columns]
         numeric_df = preprocess_for_inference(raw_df, scaler)
         scaled_data = align_and_scale_features(numeric_df, scaler, feature_columns)
 
@@ -119,6 +156,33 @@ def predict() -> Any:
         total = len(predictions)
 
         return jsonify({"predictions": predictions, "fraud_count": fraud_count, "total": total}), 200
+    except ValueError as err:
+        return jsonify({"error": str(err)}), 400
+    except FileNotFoundError as err:
+        return jsonify({"error": str(err)}), 500
+    except Exception as err:  # noqa: BLE001
+        return jsonify({"error": f"Internal server error: {err}"}), 500
+
+
+@app.route("/predict_single", methods=["POST"])
+def predict_single() -> Any:
+    try:
+        data = request.get_json()
+        if data is None or not isinstance(data, dict):
+            raise ValueError("Invalid JSON body for single transaction prediction.")
+
+        single_df = pd.DataFrame([data])
+        model, scaler, feature_columns = get_inference_components()
+        numeric_df = preprocess_for_inference(single_df, scaler)
+        scaled_data = align_and_scale_features(numeric_df, scaler, feature_columns)
+
+        raw_prediction = model.predict(scaled_data)[0]
+        anomaly_score = float(model.decision_function(scaled_data)[0])
+        confidence = compute_fraud_confidence(anomaly_score, single_df.iloc[0])
+        prediction = 1 if raw_prediction == -1 else 0
+        result = "Fraud" if prediction == 1 else "Not Fraud"
+
+        return jsonify({"prediction": prediction, "result": result, "confidence": confidence}), 200
     except ValueError as err:
         return jsonify({"error": str(err)}), 400
     except FileNotFoundError as err:

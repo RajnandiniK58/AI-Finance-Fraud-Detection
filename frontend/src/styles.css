@@ -19,11 +19,28 @@ h1 {
   margin-bottom: 20px;
 }
 
+h2 {
+  margin-top: 24px;
+  margin-bottom: 12px;
+}
+
 .upload-form {
   display: flex;
   gap: 12px;
   align-items: center;
   margin-bottom: 16px;
+}
+
+.single-form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.single-form input {
+  padding: 8px;
+  border: 1px solid #ddd;
+  border-radius: 6px;
 }
 
 button {
@@ -75,4 +92,14 @@ thead {
 
 .fraud-row {
   background: #ffe8e8;
+}
+
+.result-fraud {
+  color: #b00020;
+  font-weight: 700;
+}
+
+.result-safe {
+  color: #1e7e34;
+  font-weight: 700;
 }
